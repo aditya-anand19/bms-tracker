@@ -1,0 +1,43 @@
+name: BookMyShow Tracker
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # restarts the tracker within ~5 min whenever a run ends
+  workflow_dispatch:         # adds a "Run workflow" button for manual tests
+
+# Only one tracker runs at a time; extra scheduled starts wait in line.
+concurrency:
+  group: bms-tracker
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install libraries
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Check BookMyShow
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python tracker.py
+
+      - name: Save screenshot of the page
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: last-check-screenshot
+          path: last_check.png
+          retention-days: 1
+          if-no-files-found: ignore
