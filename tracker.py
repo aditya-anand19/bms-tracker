@@ -23,14 +23,18 @@ from playwright.sync_api import sync_playwright
 
 # Your BookMyShow booking URL (city + movie + language/format chosen).
 # Copy it from the address bar after clicking "Book tickets".
-BOOKING_URL = "PASTE_YOUR_BOOKMYSHOW_URL_HERE"
+BOOKING_URL = "https://in.bookmyshow.com/movies/hyderabad/namit-malhotras-ramayana/buytickets/ET00523251/20261105?etCodes=ET00523251&language=hindi&refEventCode=ET00523251"
 
 # Show date you want, YYYYMMDD (5 Nov 2026 = 20261105)
 TARGET_DATE = "20261105"
 
-# Only alert if one of these words is on the page, e.g. ["PVR", "IMAX"].
-# Leave [] to alert for ANY theatre.
-THEATRE_KEYWORDS = []
+# The ONE theatre you want, as BookMyShow writes it (part of the name is fine).
+# Leave "" to alert for ANY theatre.
+THEATRE_NAME = "Allu Cinemas"
+
+# The format you want at that theatre, e.g. "Dolby Cinema 3D", "IMAX".
+# Leave "" to alert for any format at that theatre.
+FORMAT_KEYWORD = "Dolby Cinema"
 
 # How often to check, in seconds. 60 is a good balance; going much lower
 # makes BookMyShow more likely to block you.
@@ -98,11 +102,19 @@ def check(page, target_url):
     if TARGET_DATE not in final_url:
         return "not_yet", "Date not open yet (redirected to another date)."
 
-    if THEATRE_KEYWORDS:
-        hits = [k for k in THEATRE_KEYWORDS if k.lower() in text]
-        if not hits:
-            return "not_yet", "Date is open, but your theatre/format isn't listed yet."
-        return "found", f"Shows open on {TARGET_DATE} with: {', '.join(hits)}"
+    if THEATRE_NAME:
+        name = THEATRE_NAME.lower()
+        if name not in text:
+            return "not_yet", f"Date is open, but {THEATRE_NAME} isn't listed yet."
+        if FORMAT_KEYWORD:
+            fmt = FORMAT_KEYWORD.lower()
+            # Look only at the text right after the theatre's name (its show
+            # times), so a format shown for some OTHER theatre doesn't count.
+            blocks = [text[i:i + 700] for i in [m.start() for m in re.finditer(re.escape(name), text)]]
+            if not any(fmt in b for b in blocks):
+                return "not_yet", f"{THEATRE_NAME} is listed, but no {FORMAT_KEYWORD} shows yet."
+            return "found", f"{FORMAT_KEYWORD} shows open at {THEATRE_NAME} on {TARGET_DATE}!"
+        return "found", f"Shows open at {THEATRE_NAME} on {TARGET_DATE}!"
 
     return "found", f"Shows are open on {TARGET_DATE}!"
 
