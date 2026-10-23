@@ -120,33 +120,41 @@ def main():
     target_url = build_target_url(BOOKING_URL, TARGET_DATE)
     log(f"Watching: {target_url}")
     stop_at = time.time() + RUN_FOR_MINUTES * 60
-    first = True
+    test_results = []
     errors_in_a_row = 0
     blocked_in_a_row = 0
 
     with sync_playwright() as p:
-        # Visible (non-headless) browser on a virtual screen: looks like a real user.
-        browser = p.chromium.launch(headless=False)
-        context = browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            locale="en-IN",
-            timezone_id="Asia/Kolkata",
-        )
-        page = context.new_page()
-
         while time.time() < stop_at:
+            # A brand-new browser with NO cookies for every check.
+            # (BookMyShow allows the first visit but flags the cookie it sets,
+            #  so reusing one browser got every later check blocked.)
+            browser = p.chromium.launch(headless=False)
             try:
+                context = browser.new_context(
+                    viewport={"width": 1280, "height": 900},
+                    locale="en-IN",
+                    timezone_id="Asia/Kolkata",
+                )
+                page = context.new_page()
                 status, msg = check(page, target_url)
                 errors_in_a_row = 0
             except Exception as e:
                 status, msg = "error", f"Check failed: {e}"
                 errors_in_a_row += 1
+            finally:
+                browser.close()
             log(f"{status.upper()}: {msg}")
 
-            if first and MANUAL_RUN:
-                send_telegram(f"Tracker test run OK (via your phone)\n"
-                              f"Status: {status}\n{msg}\n{target_url}")
-            first = False
+            # Manual test run: report after 3 checks, so you know repeated
+            # checks get through too (not just the first one).
+            if MANUAL_RUN and len(test_results) < 3:
+                test_results.append(status)
+                if len(test_results) == 3:
+                    ok = all(s in ("not_yet", "found") for s in test_results)
+                    send_telegram(f"Tracker test: {'OK' if ok else 'PROBLEM'} (via your phone)\n"
+                                  f"First 3 checks: {', '.join(test_results)}\n"
+                                  f"Latest: {msg}\n{target_url}")
 
             if status == "found":
                 send_telegram(f"BOOK NOW!!! {msg}\n{target_url}")
@@ -155,7 +163,6 @@ def main():
             # warns you (it sends that warning directly, not via the phone).
             if errors_in_a_row >= 5:
                 log("Too many failed checks in a row - is the phone online?")
-                browser.close()
                 sys.exit(1)
 
             blocked_in_a_row = blocked_in_a_row + 1 if status == "blocked" else 0
@@ -165,7 +172,6 @@ def main():
             wait = CHECK_EVERY_SECONDS * (5 if blocked_in_a_row >= 3 else 1)
             time.sleep(wait + random.randint(0, 15))
 
-        browser.close()
     log("Run finished; the schedule will start the next one.")
 
 
