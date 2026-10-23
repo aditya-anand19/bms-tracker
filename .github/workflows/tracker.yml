@@ -101,22 +101,34 @@ jobs:
           python -m playwright install --with-deps chromium
           sudo apt-get install -y -qq tinyproxy
 
-      # A small local proxy for Chrome, running as its own user "bmsproxy".
-      # Later, everything sent by that user is routed through your phone.
+      # A small local proxy for Chrome. It is started by root (so it can always read
+      # its config) and then switches itself to the restricted user "bmsproxy".
+      # Everything sent by that user is later routed through your phone.
+      # This step never fails the run: if the proxy can't start, you get a message.
       - name: Start Chrome's proxy
+        id: proxy
         if: steps.phone.outputs.online == 'yes'
         run: |
           sudo systemctl stop tinyproxy 2>/dev/null || true
-          sudo pkill tinyproxy 2>/dev/null || true
-          id -u bmsproxy >/dev/null 2>&1 || sudo useradd -r -M -s /usr/sbin/nologin bmsproxy
-          printf '%s\n' "Port 8899" "Listen 127.0.0.1" "Timeout 120" "MaxClients 200" \
-            "Allow 127.0.0.1" "LogLevel Error" "DisableViaHeader Yes" \
-            | sudo tee /etc/tinyproxy-bms.conf >/dev/null
-          sudo chmod 644 /etc/tinyproxy-bms.conf
-          sudo -u bmsproxy tinyproxy -c /etc/tinyproxy-bms.conf
-          sleep 2
-          pgrep -u bmsproxy tinyproxy >/dev/null && echo "Proxy running as bmsproxy on 127.0.0.1:8899"
-          echo "PROXY_UID=$(id -u bmsproxy)" >> "$GITHUB_ENV"
+          sudo systemctl disable tinyproxy 2>/dev/null || true
+          sudo pkill -x tinyproxy 2>/dev/null || true
+          id -u bmsproxy >/dev/null 2>&1 || sudo useradd -r -M -s /usr/sbin/nologin bmsproxy || true
+          sudo mkdir -p /etc/tinyproxy
+          printf '%s\n' "User bmsproxy" "Group bmsproxy" "Port 8899" "Listen 127.0.0.1" \
+            "Timeout 120" "MaxClients 200" "Allow 127.0.0.1" "LogLevel Error" "DisableViaHeader Yes" \
+            | sudo tee /etc/tinyproxy/tinyproxy.conf >/dev/null
+          sudo tinyproxy -c /etc/tinyproxy/tinyproxy.conf || true
+          OK=no
+          for _ in 1 2 3 4 5; do
+            sleep 1
+            if pgrep -u bmsproxy -x tinyproxy >/dev/null && timeout 3 bash -c '</dev/tcp/127.0.0.1/8899' 2>/dev/null; then
+              OK=yes; break
+            fi
+          done
+          echo "ok=$OK" >> "$GITHUB_OUTPUT"
+          echo "PROXY_UID=$(id -u bmsproxy 2>/dev/null || echo 0)" >> "$GITHUB_ENV"
+          echo "Chrome's proxy running as bmsproxy on 127.0.0.1:8899: $OK"
+          ps -o user,pid,cmd -C tinyproxy || true
 
       # Route ONLY the proxy user's traffic (= everything Chrome loads) through the
       # phone. Everything else keeps using GitHub's own internet.
@@ -124,9 +136,16 @@ jobs:
       - name: Route Chrome's traffic through the phone
         id: route
         if: steps.phone.outputs.online == 'yes'
+        env:
+          PROXY_OK: ${{ steps.proxy.outputs.ok }}
         run: |
           ROUTED=no
-          if sudo tailscale set --exit-node="$EXIT_NODE"; then
+          REASON=""
+          if [ "$PROXY_OK" != "yes" ]; then
+            REASON="Chrome's proxy didn't start on the GitHub server."
+          elif ! sudo tailscale set --exit-node="$EXIT_NODE"; then
+            REASON="Couldn't use your phone as the exit node."
+          else
             sleep 3
             # Proxy user (Chrome) + your Tailscale network -> through the phone
             sudo ip rule add pref 1000 uidrange "${PROXY_UID}-${PROXY_UID}" lookup 52 || true
@@ -148,14 +167,23 @@ jobs:
             [ -z "$ISP" ] && ISP=unknown
             echo "Chrome's traffic appears from: ${ISP} (${COUNTRY})"
             echo "Telegram/other traffic appears from: $(curl -s --max-time 15 https://ipinfo.io/org | head -n1)"
-            if [ "$COUNTRY" = "IN" ]; then ROUTED=yes; fi
+            if [ "$COUNTRY" = "IN" ]; then
+              ROUTED=yes
+            elif [ -z "$COUNTRY" ]; then
+              REASON="No internet through your phone (is 'Run as exit node' ON?)."
+            else
+              REASON="Traffic through your phone came out in '${COUNTRY}', not India (is 'Run as exit node' ON?)."
+            fi
           fi
           echo "routed=$ROUTED" >> "$GITHUB_OUTPUT"
-          echo "Routed through phone: $ROUTED"
+          echo "reason=$REASON" >> "$GITHUB_OUTPUT"
+          echo "Routed through phone: $ROUTED ${REASON}"
 
-      # ---------------- Routing failed (e.g. 'Run as exit node' is off) ----------------
+      # ---------------- Couldn't start (proxy or phone routing problem) ----------------
       - name: Routing failed - tell you (once)
         if: steps.route.outputs.routed == 'no' && steps.phone.outputs.last != 'noexit'
+        env:
+          ROUTE_FAIL_REASON: ${{ steps.route.outputs.reason }}
         run: |
           python3 tracker.py notify routing_failed || true
           echo noexit > state.txt
