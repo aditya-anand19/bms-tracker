@@ -123,8 +123,30 @@ def build_target_url(url, date):
 TARGET_URL = build_target_url(BOOKING_URL, TARGET_DATE)
 
 
+def dns_ok(host, timeout=8):
+    """Can we look up this name within `timeout` seconds? A lookup can otherwise hang
+    forever (Python has no timeout for it), which would freeze the tracker."""
+    import threading
+    result = {"ok": False}
+
+    def lookup():
+        try:
+            socket.getaddrinfo(host, 443)
+            result["ok"] = True
+        except Exception:
+            pass
+    t = threading.Thread(target=lookup, daemon=True)
+    t.start()
+    t.join(timeout)
+    if not result["ok"]:
+        log(f"DNS lookup for {host} failed or timed out")
+    return result["ok"]
+
+
 def _http_get_json(url, proxy=None, timeout=15):
     """GET a JSON url. proxy=None -> direct (GitHub's internet); proxy='http://..' -> via it."""
+    if not proxy and not dns_ok(urllib.parse.urlparse(url).hostname):
+        raise OSError("DNS lookup failed")
     handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy} if proxy else {})
     opener = urllib.request.build_opener(handler)
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
@@ -207,7 +229,9 @@ def send_telegram(text):
     """Send an HTML-formatted message over GitHub's own internet. Never raises."""
     if not BOT_TOKEN or not CHAT_ID:
         log("Telegram secrets missing.")
-        return False
+        return None  # not configured -> nothing to retry
+    if not dns_ok("api.telegram.org"):
+        return False  # retried later from the outbox
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     attempts = [
@@ -237,7 +261,9 @@ def send_telegram(text):
 def send_email(text):
     """Send the same message by email (Gmail SMTP, GitHub's own internet). Never raises."""
     if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD or not EMAIL_TO:
-        return False  # email not set up -> silently skip
+        return None  # email not set up -> silently skip
+    if not dns_ok("smtp.gmail.com"):
+        return False  # retried later from the outbox
     plain = html.unescape(re.sub(r"<[^>]+>", "", text))
     subject = plain.split("\n", 1)[0].strip()[:150] + " · BMS Tracker"
     body_html = ("<div style=\"font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:1.5\">"
@@ -257,19 +283,65 @@ def send_email(text):
             return True
         except smtplib.SMTPAuthenticationError as e:
             log(f"Email login failed (check EMAIL_ADDRESS / EMAIL_APP_PASSWORD): {e}")
-            return False
+            return None  # wrong password -> retrying won't help
         except Exception as e:
             log(f"Email failed: {e}")
             time.sleep(3)
     return False
 
 
-def send(text, email=True):
-    """Send a message to Telegram and (optionally) email. Returns True if Telegram got it."""
-    ok = send_telegram(text)
-    if email:
-        send_email(text)
-    return ok
+OUTBOX = []          # messages that couldn't be sent yet: [{"text", "tg", "email"}]
+OUTBOX_FILE = "outbox.json"  # lets the workflow's own messages be retried by the tracker
+DELAYED_NOTE = "⏳ <i>Delayed message — couldn't be sent at the time shown below.</i>\n\n"
+
+
+def send(text, email=True, queue=True):
+    """Send to Telegram and (optionally) email. If a channel fails, keep the message in
+    the outbox and retry it on every loop. Returns True if delivered or queued."""
+    flush_outbox()
+    tg = send_telegram(text)
+    em = send_email(text) if email else None
+    if queue and (tg is False or em is False):
+        OUTBOX.append({"text": text, "tg": tg is False, "email": em is False})
+        del OUTBOX[:-20]  # keep at most 20 waiting messages
+        save_outbox()
+        log("Message queued; will retry.")
+        return True
+    return tg is not False
+
+
+def flush_outbox():
+    """Retry waiting messages (oldest first). Stops at the first failure."""
+    while OUTBOX:
+        item = OUTBOX[0]
+        text = DELAYED_NOTE + item["text"]
+        if item["tg"]:
+            if send_telegram(text) is False:
+                return
+            item["tg"] = False
+        if item["email"]:
+            if send_email(text) is False:
+                return
+            item["email"] = False
+        OUTBOX.pop(0)
+        save_outbox()
+        log("Delivered a delayed message.")
+
+
+def save_outbox():
+    try:
+        with open(OUTBOX_FILE, "w") as f:
+            json.dump(OUTBOX, f)
+    except OSError:
+        pass
+
+
+def load_outbox():
+    try:
+        with open(OUTBOX_FILE) as f:
+            OUTBOX[:] = [x for x in json.load(f) if isinstance(x, dict) and "text" in x]
+    except (OSError, ValueError):
+        pass
 
 
 # ============================ messages ============================
@@ -525,6 +597,7 @@ def main():
     from playwright.sync_api import sync_playwright  # only needed for checking
 
     log(f"Watching: {TARGET_URL}")
+    load_outbox()  # messages the workflow couldn't send earlier in this run
     stop_at = time.time() + RUN_FOR_MINUTES * 60
     test_results = []
     checks = 0
@@ -540,6 +613,7 @@ def main():
         checks_since_connect = 0
         error_warned = False
         while time.time() < stop_at:
+            flush_outbox()  # deliver anything that couldn't be sent earlier
             # ---------- Is the phone still there? ----------
             if not phone_reachable():
                 phone_misses += 1
@@ -636,7 +710,7 @@ def main():
                 # (so the alerts stop by themselves if the shows disappear).
                 time.sleep(BOOK_NOW_EVERY_SECONDS)
                 book_now_count += 1
-                send(msg_book_now(msg, book_now_count), email=False)
+                send(msg_book_now(msg, book_now_count), email=False, queue=False)
                 time.sleep(BOOK_NOW_EVERY_SECONDS)
                 continue
 
@@ -656,8 +730,9 @@ def notify(kind):
     if kind not in builders:
         log(f"Unknown notify kind: {kind}")
         return
+    load_outbox()
     ok = send(builders[kind]())
-    log(f"Sent '{kind}' message: {'OK' if ok else 'FAILED'}")
+    log(f"'{kind}' message: {'sent' if ok and not OUTBOX else 'queued for retry' if ok else 'FAILED'}")
 
 
 if __name__ == "__main__":
