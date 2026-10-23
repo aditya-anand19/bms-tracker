@@ -4,13 +4,16 @@ name: BookMyShow Tracker
 # - Every 5 minutes GitHub starts a run (only one runs at a time).
 # - The run first checks if your phone is reachable on Tailscale.
 #     Phone OFF -> run ends quietly in ~1 minute (one "disconnected" message
-#                  only if the phone was online last time).
-#     Phone ON  -> ONLY BookMyShow (Cloudflare) traffic goes through the phone;
+#                  only if the phone was on at the previous run).
+#     Phone ON  -> EVERYTHING Chrome loads goes through the phone (via a local
+#                  proxy that runs as its own user, routed through Tailscale);
 #                  everything else (Telegram, phone checks, installs) uses
 #                  GitHub's own internet. Then tracker.py runs for ~5.5 hours:
 #                  checks every minute; if the phone drops it waits for it.
 # - Telegram: phone connected / disconnected (once each), "Still running" after
 #   every reconnect and daily at ~12 PM IST, BOOK NOW every 30 s when shows open.
+#   ALL messages are written by tracker.py (same format everywhere) and sent over
+#   GitHub's own internet, never through your phone.
 
 on:
   schedule:
@@ -27,8 +30,9 @@ jobs:
     timeout-minutes: 355
     env:
       EXIT_NODE: ${{ secrets.TS_EXIT_NODE }}
-      TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      BMS_PROXY: http://127.0.0.1:8899
     steps:
       - uses: actions/checkout@v4
 
@@ -66,13 +70,9 @@ jobs:
           echo "Previous state: $LAST | Phone online now: $ONLINE"
 
       # ---------------- Phone OFF ----------------
-      - name: Phone offline - tell you (only if it was online before)
-        if: steps.phone.outputs.online == 'no' && steps.phone.outputs.last == 'online'
-        run: |
-          curl -s --max-time 30 --retry 3 -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-            -d chat_id="${TG_CHAT}" \
-            --data-urlencode text="⏸️ Phone disconnected - BMS tracker paused.
-          I'll keep looking for your phone (no more messages until it's back)." || true
+      - name: Phone offline - tell you (only if it was on before)
+        if: steps.phone.outputs.online == 'no' && (steps.phone.outputs.last == 'online' || steps.phone.outputs.last == 'noexit')
+        run: python3 tracker.py notify disconnected || true
 
       - name: Phone offline - remember state
         if: steps.phone.outputs.online == 'no' && steps.phone.outputs.last != 'offline'
@@ -99,40 +99,56 @@ jobs:
         run: |
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
+          sudo apt-get install -y -qq tinyproxy
 
-      # Only BookMyShow's traffic goes through the phone. BookMyShow sits behind
-      # Cloudflare, so: Cloudflare addresses -> phone; everything else -> GitHub's
-      # own internet. (Tailscale keeps its routes in table 52.)
-      - name: Route ONLY BookMyShow through the phone
+      # A small local proxy for Chrome, running as its own user "bmsproxy".
+      # Later, everything sent by that user is routed through your phone.
+      - name: Start Chrome's proxy
+        if: steps.phone.outputs.online == 'yes'
+        run: |
+          sudo systemctl stop tinyproxy 2>/dev/null || true
+          sudo pkill tinyproxy 2>/dev/null || true
+          id -u bmsproxy >/dev/null 2>&1 || sudo useradd -r -M -s /usr/sbin/nologin bmsproxy
+          printf '%s\n' "Port 8899" "Listen 127.0.0.1" "Timeout 120" "MaxClients 200" \
+            "Allow 127.0.0.1" "LogLevel Error" "DisableViaHeader Yes" \
+            | sudo tee /etc/tinyproxy-bms.conf >/dev/null
+          sudo chmod 644 /etc/tinyproxy-bms.conf
+          sudo -u bmsproxy tinyproxy -c /etc/tinyproxy-bms.conf
+          sleep 2
+          pgrep -u bmsproxy tinyproxy >/dev/null && echo "Proxy running as bmsproxy on 127.0.0.1:8899"
+          echo "PROXY_UID=$(id -u bmsproxy)" >> "$GITHUB_ENV"
+
+      # Route ONLY the proxy user's traffic (= everything Chrome loads) through the
+      # phone. Everything else keeps using GitHub's own internet.
+      # (Tailscale keeps its "through the phone" routes in table 52.)
+      - name: Route Chrome's traffic through the phone
         id: route
         if: steps.phone.outputs.online == 'yes'
         run: |
           ROUTED=no
           if sudo tailscale set --exit-node="$EXIT_NODE"; then
             sleep 3
-            # Everything else: GitHub's normal internet
+            # Proxy user (Chrome) + your Tailscale network -> through the phone
+            sudo ip rule add pref 1000 uidrange "${PROXY_UID}-${PROXY_UID}" lookup 52 || true
+            sudo ip rule add pref 1000 to 100.64.0.0/10 lookup 52 || true
+            # Everything else -> GitHub's normal internet
             sudo ip rule add pref 1100 lookup main || true
-            # Your Tailscale network + Cloudflare (BookMyShow): through the phone
-            for r in 100.64.0.0/10 \
-                     173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 \
-                     141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 \
-                     197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 \
-                     104.24.0.0/14 172.64.0.0/13 131.0.72.0/22; do
-              sudo ip rule add pref 1000 to "$r" lookup 52 || true
-            done
             sudo ip route flush cache || true
             echo "Routing rules:"; ip rule show
 
-            # Self-check: where does Cloudflare (BookMyShow) see us? Should be India.
-            TRACE=$(curl -4 -s --max-time 30 https://www.cloudflare.com/cdn-cgi/trace || true)
-            CF_IP=$(echo "$TRACE" | grep '^ip=' | cut -d= -f2 | tr -d '\r')
-            CF_LOC=$(echo "$TRACE" | grep '^loc=' | cut -d= -f2 | tr -d '\r')
-            ISP=$(curl -s --max-time 15 "https://ipinfo.io/${CF_IP}/org" | head -n1 | tr -d '\r"{}' || true)
+            # Self-check through the SAME proxy Chrome uses: must appear from India.
+            INFO=$(curl --noproxy '' -s --max-time 30 -x http://127.0.0.1:8899 https://ipinfo.io/json || true)
+            COUNTRY=$(echo "$INFO" | jq -r '.country // empty' 2>/dev/null || true)
+            ISP=$(echo "$INFO" | jq -r '.org // empty' 2>/dev/null || true)
+            if [ -z "$COUNTRY" ]; then
+              # backup check via Cloudflare
+              TRACE=$(curl --noproxy '' -s --max-time 30 -x http://127.0.0.1:8899 https://www.cloudflare.com/cdn-cgi/trace || true)
+              COUNTRY=$(echo "$TRACE" | grep '^loc=' | cut -d= -f2 | tr -d '\r')
+            fi
             [ -z "$ISP" ] && ISP=unknown
-            echo "BookMyShow traffic appears from: ${CF_IP} (${CF_LOC}) - ${ISP}"
+            echo "Chrome's traffic appears from: ${ISP} (${COUNTRY})"
             echo "Telegram/other traffic appears from: $(curl -s --max-time 15 https://ipinfo.io/org | head -n1)"
-            echo "ISP=${ISP} (${CF_LOC})" >> "$GITHUB_ENV"
-            if [ "$CF_LOC" = "IN" ]; then ROUTED=yes; fi
+            if [ "$COUNTRY" = "IN" ]; then ROUTED=yes; fi
           fi
           echo "routed=$ROUTED" >> "$GITHUB_OUTPUT"
           echo "Routed through phone: $ROUTED"
@@ -141,10 +157,7 @@ jobs:
       - name: Routing failed - tell you (once)
         if: steps.route.outputs.routed == 'no' && steps.phone.outputs.last != 'noexit'
         run: |
-          curl -s --max-time 30 --retry 3 -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-            -d chat_id="${TG_CHAT}" \
-            --data-urlencode text="⚠️ Tailscale is on, but BookMyShow traffic couldn't be routed through your phone.
-          Check that 'Run as exit node' is ON in the Tailscale app. I'll retry every 5 minutes." || true
+          python3 tracker.py notify routing_failed || true
           echo noexit > state.txt
 
       - name: Routing failed - save state
@@ -157,12 +170,7 @@ jobs:
       # ---------------- Routed OK: run the tracker ----------------
       - name: Tell you the phone (re)connected
         if: steps.route.outputs.routed == 'yes' && steps.phone.outputs.last != 'online'
-        run: |
-          curl -s --max-time 30 --retry 3 -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-            -d chat_id="${TG_CHAT}" \
-            --data-urlencode text="✅ Phone connected - BMS tracker is running.
-          Network: ${ISP}
-          Doing a check now; you'll get a confirmation in a minute." || true
+        run: python3 tracker.py notify connected || true
 
       - name: Remember state (online)
         if: steps.route.outputs.routed == 'yes'
@@ -187,8 +195,6 @@ jobs:
         id: tracker
         if: steps.route.outputs.routed == 'yes'
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           JUST_CONNECTED: ${{ steps.phone.outputs.last != 'online' }}
         run: xvfb-run -a python tracker.py
 
