@@ -10,6 +10,8 @@ GitHub's own internet.
                  minute; one "reconnected" message when it's back.
 - Shows found  : "BOOK NOW" + link every 30 seconds.
 - Daily ~12 PM : one "Still running" message while connected.
+- Every message goes to Telegram and (if set up) to email; BOOK NOW is
+  emailed once per opening (Telegram repeats it every 30 s).
 
 The workflow also uses this file to send its own messages:
     python3 tracker.py notify connected | disconnected | routing_failed
@@ -21,6 +23,7 @@ import json
 import os
 import random
 import re
+import smtplib
 import socket
 import subprocess
 import sys
@@ -29,6 +32,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 
 # ======================= SETTINGS (edit these) =======================
 
@@ -63,6 +67,10 @@ HEARTBEAT_HOUR = 12
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+# Optional email (Gmail + App Password). Leave the secrets empty to turn email off.
+EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS", "").strip()
+EMAIL_APP_PASSWORD = os.environ.get("EMAIL_APP_PASSWORD", "").replace(" ", "").strip()
+EMAIL_TO = os.environ.get("EMAIL_TO", "").strip() or EMAIL_ADDRESS
 MANUAL_RUN = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
 # Set by the workflow when the phone has just (re)connected
 JUST_CONNECTED = os.environ.get("JUST_CONNECTED") == "true"
@@ -224,6 +232,44 @@ def send_telegram(text):
                 log(f"Telegram failed: {e}")
                 time.sleep(3)
     return False
+
+
+def send_email(text):
+    """Send the same message by email (Gmail SMTP, GitHub's own internet). Never raises."""
+    if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD or not EMAIL_TO:
+        return False  # email not set up -> silently skip
+    plain = html.unescape(re.sub(r"<[^>]+>", "", text))
+    subject = plain.split("\n", 1)[0].strip()[:150] + " · BMS Tracker"
+    body_html = ("<div style=\"font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:1.5\">"
+                 + re.sub(r"(https://in\.bookmyshow\.com/\S+)", r'<a href="\1">\1</a>', text).replace("\n", "<br>")
+                 + "</div>")
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = f"BMS Tracker <{EMAIL_ADDRESS}>"
+    msg["To"] = EMAIL_TO
+    msg.set_content(plain)
+    msg.add_alternative(body_html, subtype="html")
+    for _ in range(2):
+        try:
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as smtp:
+                smtp.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
+                smtp.send_message(msg)
+            return True
+        except smtplib.SMTPAuthenticationError as e:
+            log(f"Email login failed (check EMAIL_ADDRESS / EMAIL_APP_PASSWORD): {e}")
+            return False
+        except Exception as e:
+            log(f"Email failed: {e}")
+            time.sleep(3)
+    return False
+
+
+def send(text, email=True):
+    """Send a message to Telegram and (optionally) email. Returns True if Telegram got it."""
+    ok = send_telegram(text)
+    if email:
+        send_email(text)
+    return ok
 
 
 # ============================ messages ============================
@@ -394,7 +440,7 @@ def maybe_send_heartbeat(status, msg, checks_this_run, force=False):
         if now.hour < HEARTBEAT_HOUR or last_sent == today:
             return
 
-    if send_telegram(msg_status("first" if force else "daily", status, msg, checks_this_run)):
+    if send(msg_status("first" if force else "daily", status, msg, checks_this_run)):
         # Counts as today's daily message if it's already past the daily hour,
         # so you don't get a duplicate a minute later.
         if not force or (HEARTBEAT_HOUR is not None and now.hour >= HEARTBEAT_HOUR):
@@ -502,7 +548,7 @@ def main():
                 if phone_online and phone_misses >= 3:
                     phone_online = False
                     write_state("offline")
-                    send_telegram(msg_disconnected())
+                    send(msg_disconnected())
                     log("Phone disconnected - waiting for it to come back.")
                 time.sleep(15 if phone_online else 60)
                 continue
@@ -515,7 +561,7 @@ def main():
                 checks_since_connect = 0
                 write_state("online")
                 ensure_proxy()
-                send_telegram(msg_connected(reconnected=True))
+                send(msg_connected(reconnected=True))
                 log("Phone reconnected.")
 
             # ---------- Check BookMyShow ----------
@@ -562,34 +608,35 @@ def main():
             if MANUAL_RUN and len(test_results) < 3:
                 test_results.append(status)
                 if len(test_results) == 3:
-                    send_telegram(msg_test(test_results, msg))
+                    send(msg_test(test_results, msg))
 
             if status == "found":
                 book_now_count += 1
-                send_telegram(msg_book_now(msg, book_now_count))
+                # Telegram every time; email only for the first alert of this opening
+                send(msg_book_now(msg, book_now_count), email=(book_now_count == 1))
             else:
                 book_now_count = 0
                 if status == "unsure" and not unsure_sent:
-                    send_telegram(msg_maybe_open(msg))
+                    send(msg_maybe_open(msg))
                     unsure_sent = True
 
             # Page keeps failing even though the phone answers: warn once, keep going.
             if errors_in_a_row >= 5 and not error_warned:
-                send_telegram(msg_pages_failing(msg))
+                send(msg_pages_failing(msg))
                 error_warned = True
             if errors_in_a_row == 0:
                 error_warned = False
 
             blocked_in_a_row = blocked_in_a_row + 1 if status == "blocked" else 0
             if blocked_in_a_row == 3:
-                send_telegram(msg_blocked())
+                send(msg_blocked())
 
             if status == "found":
                 # Shows are open: repeat BOOK NOW every 30 s, re-check the page every minute
                 # (so the alerts stop by themselves if the shows disappear).
                 time.sleep(BOOK_NOW_EVERY_SECONDS)
                 book_now_count += 1
-                send_telegram(msg_book_now(msg, book_now_count))
+                send(msg_book_now(msg, book_now_count), email=False)
                 time.sleep(BOOK_NOW_EVERY_SECONDS)
                 continue
 
@@ -609,7 +656,7 @@ def notify(kind):
     if kind not in builders:
         log(f"Unknown notify kind: {kind}")
         return
-    ok = send_telegram(builders[kind]())
+    ok = send(builders[kind]())
     log(f"Sent '{kind}' message: {'OK' if ok else 'FAILED'}")
 
 
