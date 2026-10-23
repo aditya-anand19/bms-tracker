@@ -13,7 +13,8 @@ name: BookMyShow Tracker
 # - Telegram: phone connected / disconnected (once each), "Still running" after
 #   every reconnect and daily at ~12 PM IST, BOOK NOW every 30 s when shows open.
 #   ALL messages are written by tracker.py (same format everywhere) and sent over
-#   GitHub's own internet, never through your phone.
+#   GitHub's own internet, never through your phone. Copies also go to email
+#   (Gmail) if the EMAIL_* secrets are set; BOOK NOW is emailed once per opening.
 
 on:
   schedule:
@@ -32,6 +33,10 @@ jobs:
       EXIT_NODE: ${{ secrets.TS_EXIT_NODE }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      # Optional email copies (Gmail). If these secrets don't exist, email is simply off.
+      EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
+      EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+      EMAIL_TO: ${{ secrets.EMAIL_TO }}
       BMS_PROXY: http://127.0.0.1:8899
     steps:
       - uses: actions/checkout@v4
