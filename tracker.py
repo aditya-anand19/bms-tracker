@@ -1,19 +1,20 @@
 """
-BookMyShow Show Tracker - GitHub Actions + your phone (Tailscale exit node)
---------------------------------------------------------------------------
-GitHub runs this in the cloud; all its internet traffic goes out through your
-phone, so BookMyShow sees a normal mobile connection instead of a cloud server.
+BookMyShow Show Tracker - GitHub Actions + your phone (Tailscale)
+-----------------------------------------------------------------
+GitHub runs this in the cloud. Only BookMyShow traffic goes through your phone
+(the workflow sets that up); Telegram and everything else use GitHub's internet.
 
-- Silent while shows aren't open.
-- When Dolby Cinema opens at your theatre on your date: "BOOK NOW" + link
-  on Telegram every CHECK_EVERY_SECONDS until you disable the workflow.
+- Phone online : checks BookMyShow every minute (silent while not open).
+- Phone offline: one "disconnected" message, then looks for the phone every
+                 minute; one "reconnected" message when it's back.
+- Shows found  : "BOOK NOW" + link every 30 seconds.
+- Daily ~12 PM : one "Still running" message while connected.
 """
 
 import os
 import random
 import re
 import subprocess
-import sys
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -95,6 +96,27 @@ def phone_reachable():
         return False
 
 
+def write_state(state):
+    """Remember online/offline for the next run (the workflow saves this file)."""
+    try:
+        with open("state.txt", "w") as f:
+            f.write(state)
+    except OSError:
+        pass
+
+
+def network_via_phone():
+    """Which network BookMyShow sees (asks Cloudflare, which goes via the phone)."""
+    try:
+        t = requests.get("https://www.cloudflare.com/cdn-cgi/trace", timeout=20).text
+        ip = re.search(r"^ip=(.+)$", t, re.M).group(1)
+        loc = re.search(r"^loc=(.+)$", t, re.M).group(1)
+        org = requests.get(f"https://ipinfo.io/{ip}/org", timeout=15).text.strip()
+        return f"{org} ({loc})"
+    except Exception:
+        return "unknown"
+
+
 def maybe_send_heartbeat(status, msg, checks_this_run, force=False):
     """Tell the user everything is fine: once a day after HEARTBEAT_HOUR IST,
     or right away when force=True (phone just reconnected)."""
@@ -126,8 +148,11 @@ def maybe_send_heartbeat(status, msg, checks_this_run, force=False):
         # Counts as today's daily message if it's already past the daily hour,
         # so you don't get a duplicate a minute later.
         if not force or (HEARTBEAT_HOUR is not None and now.hour >= HEARTBEAT_HOUR):
-            with open(HEARTBEAT_FILE, "w") as f:
-                f.write(today)
+            try:
+                with open(HEARTBEAT_FILE, "w") as f:
+                    f.write(today)
+            except OSError:
+                pass
 
 
 def build_target_url(url, date):
@@ -220,24 +245,45 @@ def main():
 
     with sync_playwright() as p:
         phone_misses = 0
+        phone_online = True          # the workflow only starts us when the phone is online
+        just_connected = JUST_CONNECTED
+        checks_since_connect = 0
+        error_warned = False
         while time.time() < stop_at:
-            # Is the phone still there? If not 3 times in a row (~1 min), stop
-            # so the workflow can tell you right away.
+            # ---------- Is the phone still there? ----------
             if not phone_reachable():
                 phone_misses += 1
-                log(f"Phone not reachable ({phone_misses}/3)")
-                if phone_misses >= 3:
-                    log("Phone disconnected - stopping.")
-                    sys.exit(3)
-                time.sleep(15)
+                log(f"Phone not reachable ({phone_misses}/3)" if phone_online
+                    else "Phone still offline - checking again in 1 min")
+                if phone_online and phone_misses >= 3:
+                    phone_online = False
+                    write_state("offline")
+                    send_telegram("\u23f8\ufe0f Phone disconnected - BMS tracker paused.\n"
+                                  "I'll keep looking for your phone every minute (no more messages "
+                                  "until it's back).")
+                    log("Phone disconnected - waiting for it to come back.")
+                time.sleep(15 if phone_online else 60)
                 continue
             phone_misses = 0
 
+            if not phone_online:
+                # Phone came back during this run
+                phone_online = True
+                just_connected = True
+                checks_since_connect = 0
+                write_state("online")
+                send_telegram("\u2705 Phone reconnected - BMS tracker is running again.\n"
+                              f"Network: {network_via_phone()}\n"
+                              "Doing a check now; you'll get a confirmation in a minute.")
+                log("Phone reconnected.")
+
+            # ---------- Check BookMyShow ----------
             # A brand-new browser with NO cookies for every check.
             # (BookMyShow allows the first visit but flags the cookie it sets,
             #  so reusing one browser got every later check blocked.)
-            browser = p.chromium.launch(headless=False)
+            browser = None
             try:
+                browser = p.chromium.launch(headless=False)
                 context = browser.new_context(
                     viewport={"width": 1280, "height": 900},
                     locale="en-IN",
@@ -250,12 +296,19 @@ def main():
                 status, msg = "error", f"Check failed: {e}"
                 errors_in_a_row += 1
             finally:
-                browser.close()
+                if browser is not None:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
             log(f"{status.upper()}: {msg}")
             checks += 1
-            if checks == 1 and JUST_CONNECTED:
+            checks_since_connect += 1
+
+            if checks_since_connect == 1 and just_connected:
                 # Phone just (re)connected: confirm the first real check worked.
                 maybe_send_heartbeat(status, msg, checks, force=True)
+                just_connected = False
             else:
                 maybe_send_heartbeat(status, msg, checks)
 
@@ -275,16 +328,26 @@ def main():
                 send_telegram(f"MAYBE OPEN - please check manually.\n{msg}\n{target_url}")
                 unsure_sent = True
 
-            # Phone unreachable for ~5 checks -> fail the run so the workflow
-            # warns you (it sends that warning directly, not via the phone).
-            if errors_in_a_row >= 5:
-                log("Too many failed checks in a row - is the phone online?")
-                sys.exit(1)
+            # Page keeps failing even though the phone answers: warn once, keep going.
+            if errors_in_a_row >= 5 and not error_warned:
+                send_telegram("\u26a0\ufe0f Your phone is connected, but BookMyShow pages keep "
+                              f"failing to load.\nLast error: {msg[:200]}\nI'll keep trying.")
+                error_warned = True
+            if errors_in_a_row == 0:
+                error_warned = False
 
             blocked_in_a_row = blocked_in_a_row + 1 if status == "blocked" else 0
             if blocked_in_a_row == 3:
                 send_telegram("WARNING: BookMyShow is blocking checks even through "
                               "your phone. Slowing down to every 5 min.")
+            if status == "found":
+                # Shows are open: repeat BOOK NOW every 30 s, re-check the page every minute
+                # (so the alerts stop by themselves if the shows disappear).
+                time.sleep(30)
+                send_telegram(f"BOOK NOW!!! {msg}\n{target_url}")
+                time.sleep(30)
+                continue
+
             wait = CHECK_EVERY_SECONDS * (5 if blocked_in_a_row >= 3 else 1)
             time.sleep(wait + random.randint(0, 15))
 
