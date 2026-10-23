@@ -12,6 +12,7 @@ phone, so BookMyShow sees a normal mobile connection instead of a cloud server.
 import os
 import random
 import re
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -50,6 +51,8 @@ HEARTBEAT_HOUR = 12
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 MANUAL_RUN = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+# Set by the workflow when the phone has just (re)connected
+JUST_CONNECTED = os.environ.get("JUST_CONNECTED") == "true"
 IST = timezone(timedelta(hours=5, minutes=30))
 HEARTBEAT_FILE = "heartbeat.txt"  # remembers the last day we sent it (kept by GitHub cache)
 
@@ -76,18 +79,36 @@ def send_telegram(text):
     return False
 
 
-def maybe_send_heartbeat(status, msg, checks_this_run):
-    """Once a day, after HEARTBEAT_HOUR IST, tell the user everything is fine."""
-    if HEARTBEAT_HOUR is None:
-        return
+def phone_reachable():
+    """Quick Tailscale ping to the phone (a few seconds). True if it answers."""
+    exit_node = os.environ.get("EXIT_NODE", "")
+    if not exit_node:
+        return True  # not running on GitHub with Tailscale -> don't block
+    try:
+        r = subprocess.run(
+            ["sudo", "tailscale", "ping", "--until-direct=false", "--c", "2",
+             "--timeout", "5s", exit_node],
+            capture_output=True, text=True, timeout=20,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def maybe_send_heartbeat(status, msg, checks_this_run, force=False):
+    """Tell the user everything is fine: once a day after HEARTBEAT_HOUR IST,
+    or right away when force=True (phone just reconnected)."""
     now = datetime.now(IST)
     today = now.strftime("%Y-%m-%d")
-    try:
-        last_sent = open(HEARTBEAT_FILE).read().strip()
-    except OSError:
-        last_sent = ""
-    if now.hour < HEARTBEAT_HOUR or last_sent == today:
-        return
+    if not force:
+        if HEARTBEAT_HOUR is None:
+            return
+        try:
+            last_sent = open(HEARTBEAT_FILE).read().strip()
+        except OSError:
+            last_sent = ""
+        if now.hour < HEARTBEAT_HOUR or last_sent == today:
+            return
 
     if status in ("not_yet", "found", "unsure"):
         head = "Still running \u2705 Everything is working."
@@ -102,8 +123,11 @@ def maybe_send_heartbeat(status, msg, checks_this_run):
             f"Checks in this session: {checks_this_run}\n"
             f"{tail}")
     if send_telegram(text):
-        with open(HEARTBEAT_FILE, "w") as f:
-            f.write(today)
+        # Counts as today's daily message if it's already past the daily hour,
+        # so you don't get a duplicate a minute later.
+        if not force or (HEARTBEAT_HOUR is not None and now.hour >= HEARTBEAT_HOUR):
+            with open(HEARTBEAT_FILE, "w") as f:
+                f.write(today)
 
 
 def build_target_url(url, date):
@@ -195,7 +219,20 @@ def main():
     blocked_in_a_row = 0
 
     with sync_playwright() as p:
+        phone_misses = 0
         while time.time() < stop_at:
+            # Is the phone still there? If not 3 times in a row (~1 min), stop
+            # so the workflow can tell you right away.
+            if not phone_reachable():
+                phone_misses += 1
+                log(f"Phone not reachable ({phone_misses}/3)")
+                if phone_misses >= 3:
+                    log("Phone disconnected - stopping.")
+                    sys.exit(3)
+                time.sleep(15)
+                continue
+            phone_misses = 0
+
             # A brand-new browser with NO cookies for every check.
             # (BookMyShow allows the first visit but flags the cookie it sets,
             #  so reusing one browser got every later check blocked.)
@@ -216,7 +253,11 @@ def main():
                 browser.close()
             log(f"{status.upper()}: {msg}")
             checks += 1
-            maybe_send_heartbeat(status, msg, checks)
+            if checks == 1 and JUST_CONNECTED:
+                # Phone just (re)connected: confirm the first real check worked.
+                maybe_send_heartbeat(status, msg, checks, force=True)
+            else:
+                maybe_send_heartbeat(status, msg, checks)
 
             # Manual test run: report after 3 checks, so you know repeated
             # checks get through too (not just the first one).
