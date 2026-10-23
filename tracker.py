@@ -540,6 +540,104 @@ def dates_listed(text):
     return out
 
 
+# JavaScript run inside the page: finds every date "chip" in the date row and reports
+# HOW it is displayed, so greyed-out (not yet bookable) dates can be told apart.
+DATE_CHIPS_JS = r"""
+() => {
+  const DAY = '(?:mon|tue|wed|thu|fri|sat|sun|today|tomorrow|tmrw)[a-z]*';
+  const MON = '(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*';
+  const re1 = new RegExp('^(?:' + DAY + '\\s*)?(\\d{1,2})\\s*' + MON + '(?:\\s*' + DAY + ')?$', 'i');
+  const re2 = new RegExp('^(?:' + DAY + '\\s*)?' + MON + '\\s*(\\d{1,2})(?:\\s*' + DAY + ')?$', 'i');
+  const found = [];
+  for (const el of document.querySelectorAll('body *')) {
+    if (el.children.length > 8) continue;
+    const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
+    if (!t || t.length > 28) continue;
+    let m = t.match(re1), d, mon;
+    if (m) { d = m[1]; mon = m[2]; } else { m = t.match(re2); if (m) { mon = m[1]; d = m[2]; } }
+    if (!m) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) continue;           // hidden
+    found.push({ el, label: parseInt(d, 10) + ' ' + mon.toLowerCase().slice(0, 3) });
+  }
+  // keep the OUTERMOST element of each chip (the wrapper that is clicked)
+  const set = new Set(found.map(x => x.el));
+  const chips = found.filter(x => { for (let p = x.el.parentElement; p; p = p.parentElement) if (set.has(p)) return false; return true; });
+
+  const lum = (c) => { const v = (c.match(/[\d.]+/g) || [0, 0, 0, 1]).map(Number);
+    const a = v.length > 3 ? v[3] : 1; return { l: (0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2]) / 255, a }; };
+  const BAD = /disabl|inactive|unavailable|sold-?out|greyed|grayed|not-?allowed|blocked/i;
+  return chips.map(({ el, label }) => {
+    const anc = [el, el.parentElement, el.parentElement && el.parentElement.parentElement].filter(Boolean);
+    const desc = Array.from(el.querySelectorAll('*'));
+    const nodes = anc.concat(desc);
+    let opacity = 1;
+    for (const n of anc.concat(desc)) opacity = Math.min(opacity, parseFloat(getComputedStyle(n).opacity || '1'));
+    const textNode = desc.filter(n => /\d/.test(n.innerText || '') && n.children.length === 0)[0] || el;
+    const cs = getComputedStyle(textNode), es = getComputedStyle(el);
+    let bg = { l: 1, a: 0 };
+    for (const n of [el].concat(desc)) { const b = lum(getComputedStyle(n).backgroundColor); if (b.a > bg.a) bg = b; }
+    return {
+      label,
+      ariaDisabled: nodes.some(n => n.getAttribute && (n.getAttribute('aria-disabled') === 'true' || n.hasAttribute('disabled'))),
+      badClass: nodes.some(n => BAD.test(String(n.className && n.className.baseVal !== undefined ? n.className.baseVal : n.className || ''))),
+      pointerNone: anc.some(n => getComputedStyle(n).pointerEvents === 'none'),
+      notAllowed: nodes.some(n => getComputedStyle(n).cursor === 'not-allowed'),
+      pointer: nodes.some(n => getComputedStyle(n).cursor === 'pointer'),
+      hasLink: !!(el.closest('a[href]') || el.querySelector('a[href]')),
+      opacity,
+      textLum: lum(cs.color).l,
+      bgLum: bg.l, bgAlpha: bg.a,
+      selected: nodes.some(n => n.getAttribute && (n.getAttribute('aria-selected') === 'true' || n.getAttribute('aria-current') === 'true'))
+    };
+  });
+}
+"""
+
+
+def judge_date_chips(chips):
+    """Decide which date chips are active (bookable) and which are greyed out.
+    Returns (open_labels, greyed_labels, explanation_lines)."""
+    if not chips:
+        return [], [], []
+    # chips with a coloured background (the selected date) are judged on other signals
+    coloured = [c["bgAlpha"] > 0.5 and c["bgLum"] < 0.85 for c in chips]
+    plain = [c for c, col in zip(chips, coloured) if not col]
+    lums = [c["textLum"] for c in plain]
+    mixed_grey = bool(lums) and min(lums) < 0.35 and max(lums) > 0.55
+    mixed_link = len({c["hasLink"] for c in chips}) == 2
+    mixed_pointer = len({c["pointer"] for c in chips}) == 2
+    open_, grey, lines = [], [], []
+    for c, col in zip(chips, coloured):
+        reasons = []
+        if c["ariaDisabled"]:
+            reasons.append("marked disabled")
+        if c["badClass"]:
+            reasons.append("'disabled' style class")
+        if c["pointerNone"] or c["notAllowed"]:
+            reasons.append("not clickable")
+        if c["opacity"] < 0.6:
+            reasons.append(f"faded (opacity {c['opacity']:.2f})")
+        if mixed_grey and not col and c["textLum"] > 0.55:
+            reasons.append("grey text")
+        if mixed_link and not c["hasLink"]:
+            reasons.append("no link")
+        if mixed_pointer and not c["pointer"] and not c["selected"] and not col:
+            reasons.append("no hand cursor")
+        label = c["label"]
+        if reasons:
+            if label not in grey:
+                grey.append(label)
+        elif label not in open_:
+            open_.append(label)
+        lines.append(f"{label.title()}: {'GREYED (' + ', '.join(reasons) + ')' if reasons else 'active'}")
+    open_ = [x for x in open_ if x not in grey]
+    return open_, grey, lines
+
+
+_chip_log_done = {"v": False}
+
+
 def check(page, target_url):
     """Returns (status, message). status: found / not_yet / unsure / blocked."""
     resp = page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
@@ -559,16 +657,39 @@ def check(page, target_url):
     if TARGET_DATE not in final_url:
         return "not_yet", "Date not open yet (BookMyShow redirected to another date)."
 
-    # Read the row of dates on the page (e.g. "05 nov", "thu 06 nov", "nov 7").
-    # BookMyShow only lists dates that are open for booking.
-    dates_on_page = dates_listed(text)
-    shown = ", ".join(d.title() for d in dates_on_page)  # "5 Nov, 6 Nov" for messages
-    log(f"Dates listed on page: {shown or '(could not read)'}")
     target_label = f"{int(TARGET_DATE[6:8])} {MONTHS[int(TARGET_DATE[4:6]) - 1]}"
     pretty_target = target_label.title()
-    if dates_on_page and target_label not in dates_on_page:
-        return "not_yet", (f"Date not open yet ({pretty_target} isn't in the date list; "
-                           f"open dates: {shown}).")
+    fmt_list = lambda xs: ", ".join(x.title() for x in xs)  # "5 Nov, 6 Nov"
+
+    # Read the date row, telling ACTIVE dates from GREYED-OUT (not yet bookable) ones.
+    try:
+        chips = page.evaluate(DATE_CHIPS_JS)
+    except Exception as e:
+        log(f"Couldn't inspect the date row: {e}")
+        chips = []
+    open_dates, greyed, lines = judge_date_chips(chips)
+    if lines and not _chip_log_done["v"]:
+        log("Date row as seen on the page: " + " | ".join(lines))
+        _chip_log_done["v"] = True
+    verified = bool(open_dates)  # we could see which dates are really active
+
+    if verified:
+        shown = fmt_list(open_dates) + (f"; greyed out: {fmt_list(greyed)}" if greyed else "")
+        log(f"Open dates: {fmt_list(open_dates)} | greyed out: {fmt_list(greyed) or 'none'}")
+        if target_label in greyed:
+            return "not_yet", (f"Date not open yet ({pretty_target} is shown but greyed out; "
+                               f"open dates: {shown}).")
+        if target_label not in open_dates:
+            return "not_yet", (f"Date not open yet ({pretty_target} isn't in the date list; "
+                               f"open dates: {shown}).")
+    else:
+        # Fallback: read dates from the page text (can't tell greyed from active here)
+        dates_on_page = dates_listed(text)
+        shown = fmt_list(dates_on_page)
+        log(f"Dates listed in page text (active/greyed unknown): {shown or '(could not read)'}")
+        if dates_on_page and target_label not in dates_on_page:
+            return "not_yet", (f"Date not open yet ({pretty_target} isn't in the date list; "
+                               f"dates shown: {shown}).")
 
     if THEATRE_NAME:
         name = THEATRE_NAME.lower()
@@ -585,9 +706,9 @@ def check(page, target_url):
     else:
         found_msg = f"Shows are open on {pretty_target}!"
 
-    if not dates_on_page:
-        # Couldn't read the date row, so we can't be sure -> "unsure", not "found".
-        return "unsure", found_msg + " (couldn't confirm the date on the page)"
+    if not verified:
+        # Couldn't confirm that the date is ACTIVE (not greyed out) -> "unsure", never "found".
+        return "unsure", found_msg + " (couldn't confirm the date is active on the page)"
     return "found", found_msg + f" (open dates: {shown})"
 
 
