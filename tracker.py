@@ -42,12 +42,16 @@ CHECK_EVERY_SECONDS = 60
 # How long one GitHub run keeps checking (GitHub's limit is 6 hours)
 RUN_FOR_MINUTES = 340
 
+# Daily "still running" message at this hour (IST, 24h clock). None = off.
+HEARTBEAT_HOUR = 12
+
 # =====================================================================
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 MANUAL_RUN = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
 IST = timezone(timedelta(hours=5, minutes=30))
+HEARTBEAT_FILE = "heartbeat.txt"  # remembers the last day we sent it (kept by GitHub cache)
 
 
 def log(msg):
@@ -70,6 +74,36 @@ def send_telegram(text):
     except Exception as e:
         log(f"Telegram failed: {e}")
     return False
+
+
+def maybe_send_heartbeat(status, msg, checks_this_run):
+    """Once a day, after HEARTBEAT_HOUR IST, tell the user everything is fine."""
+    if HEARTBEAT_HOUR is None:
+        return
+    now = datetime.now(IST)
+    today = now.strftime("%Y-%m-%d")
+    try:
+        last_sent = open(HEARTBEAT_FILE).read().strip()
+    except OSError:
+        last_sent = ""
+    if now.hour < HEARTBEAT_HOUR or last_sent == today:
+        return
+
+    if status in ("not_yet", "found"):
+        head = "Still running \u2705 Everything is working."
+        tail = "Sit back and relax - you'll get BOOK NOW + the link the moment it opens."
+    else:
+        head = "Still running, but the last check had a problem \u26a0\ufe0f"
+        tail = "If this repeats tomorrow, tell Claude."
+    text = (f"{head}\n"
+            f"Watching: {THEATRE_NAME or 'any theatre'} {FORMAT_KEYWORD}, {TARGET_DATE}\n"
+            f"Last check: {now.strftime('%d %b %H:%M')} IST - {status}\n"
+            f"({msg})\n"
+            f"Checks in this session: {checks_this_run}\n"
+            f"{tail}")
+    if send_telegram(text):
+        with open(HEARTBEAT_FILE, "w") as f:
+            f.write(today)
 
 
 def build_target_url(url, date):
@@ -121,6 +155,7 @@ def main():
     log(f"Watching: {target_url}")
     stop_at = time.time() + RUN_FOR_MINUTES * 60
     test_results = []
+    checks = 0
     errors_in_a_row = 0
     blocked_in_a_row = 0
 
@@ -145,6 +180,8 @@ def main():
             finally:
                 browser.close()
             log(f"{status.upper()}: {msg}")
+            checks += 1
+            maybe_send_heartbeat(status, msg, checks)
 
             # Manual test run: report after 3 checks, so you know repeated
             # checks get through too (not just the first one).
