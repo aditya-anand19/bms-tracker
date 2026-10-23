@@ -49,6 +49,16 @@ jobs:
           hostname: github-bms-tracker
           args: --accept-dns=false
 
+      # Name lookups (DNS) must use GitHub's own DNS, never your phone. Otherwise,
+      # when the phone goes offline, lookups like api.telegram.org hang and
+      # messages get stuck until the phone comes back.
+      - name: Keep DNS on GitHub's own servers
+        run: |
+          sudo tailscale set --accept-dns=false || true
+          sudo resolvectl revert tailscale0 2>/dev/null || true
+          sudo resolvectl flush-caches 2>/dev/null || true
+          echo "DNS servers in use:"; resolvectl dns 2>/dev/null || cat /etc/resolv.conf
+
       # 2. What was the phone's state at the end of the previous run?
       - name: Load last phone state
         uses: actions/cache/restore@v4
@@ -152,6 +162,11 @@ jobs:
             REASON="Couldn't use your phone as the exit node."
           else
             sleep 3
+            # Make sure DNS still uses GitHub's own servers (not the phone)
+            sudo tailscale set --accept-dns=false || true
+            sudo resolvectl revert tailscale0 2>/dev/null || true
+            sudo resolvectl flush-caches 2>/dev/null || true
+            echo "DNS servers in use:"; resolvectl dns 2>/dev/null || cat /etc/resolv.conf
             # Proxy user (Chrome) + your Tailscale network -> through the phone
             sudo ip rule add pref 1000 uidrange "${PROXY_UID}-${PROXY_UID}" lookup 52 || true
             sudo ip rule add pref 1000 to 100.64.0.0/10 lookup 52 || true
