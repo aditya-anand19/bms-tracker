@@ -28,7 +28,7 @@ BOOKING_URL = (
 )
 
 # Show date you want, YYYYMMDD
-TARGET_DATE = "20261119"
+TARGET_DATE = "20261105"
 
 # The ONE theatre you want ("" = any theatre)
 THEATRE_NAME = "Allu Cinemas"
