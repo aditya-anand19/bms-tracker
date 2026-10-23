@@ -3,14 +3,14 @@ name: BookMyShow Tracker
 # How it behaves:
 # - Every 5 minutes GitHub starts a run (only one runs at a time).
 # - The run first checks if your phone is reachable on Tailscale.
-#     Phone OFF  -> run ends quietly in ~1 minute. No messages.
-#     Phone ON   -> sends ONLY BookMyShow (Cloudflare) traffic through the phone,
-#                   everything else (Telegram, phone checks, installs) uses
-#                   GitHub's own internet. Then runs tracker.py
-#                   (checks every minute for ~5.5 hours).
-# - Telegram messages only when the phone CONNECTS or DISCONNECTS,
-#   a "Still running" message after every reconnect and daily at ~12 PM IST,
-#   and of course BOOK NOW when shows open.
+#     Phone OFF -> run ends quietly in ~1 minute (one "disconnected" message
+#                  only if the phone was online last time).
+#     Phone ON  -> ONLY BookMyShow (Cloudflare) traffic goes through the phone;
+#                  everything else (Telegram, phone checks, installs) uses
+#                  GitHub's own internet. Then tracker.py runs for ~5.5 hours:
+#                  checks every minute; if the phone drops it waits for it.
+# - Telegram: phone connected / disconnected (once each), "Still running" after
+#   every reconnect and daily at ~12 PM IST, BOOK NOW every 30 s when shows open.
 
 on:
   schedule:
@@ -32,7 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Join your Tailscale network (NOT routing through the phone yet)
+      # 1. Join your Tailscale network (not routing anything through the phone yet)
       - name: Join Tailscale
         uses: tailscale/github-action@v3
         with:
@@ -40,9 +40,8 @@ jobs:
           hostname: github-bms-tracker
           args: --accept-dns=false
 
-      # 2. What was the phone's state on the previous run? (online / offline)
+      # 2. What was the phone's state at the end of the previous run?
       - name: Load last phone state
-        id: last
         uses: actions/cache/restore@v4
         with:
           path: state.txt
@@ -53,10 +52,11 @@ jobs:
       - name: Is the phone online?
         id: phone
         run: |
-          LAST=$(cat state.txt 2>/dev/null || echo unknown)
+          LAST=$(head -n1 state.txt 2>/dev/null | tr -d '\r\n ' || true)
+          [ -z "$LAST" ] && LAST=unknown
           echo "last=$LAST" >> "$GITHUB_OUTPUT"
           ONLINE=no
-          for i in 1 2 3; do
+          for _ in 1 2 3; do
             if sudo tailscale ping --until-direct=false --c 2 --timeout 8s "$EXIT_NODE"; then
               ONLINE=yes; break
             fi
@@ -65,7 +65,15 @@ jobs:
           echo "online=$ONLINE" >> "$GITHUB_OUTPUT"
           echo "Previous state: $LAST | Phone online now: $ONLINE"
 
-      # ---------------- Phone OFF: remember it and stop quietly ----------------
+      # ---------------- Phone OFF ----------------
+      - name: Phone offline - tell you (only if it was online before)
+        if: steps.phone.outputs.online == 'no' && steps.phone.outputs.last == 'online'
+        run: |
+          curl -s --max-time 30 --retry 3 -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            -d chat_id="${TG_CHAT}" \
+            --data-urlencode text="⏸️ Phone disconnected - BMS tracker paused.
+          I'll keep looking for your phone (no more messages until it's back)." || true
+
       - name: Phone offline - remember state
         if: steps.phone.outputs.online == 'no' && steps.phone.outputs.last != 'offline'
         run: echo offline > state.txt
@@ -77,14 +85,14 @@ jobs:
           path: state.txt
           key: phonestate-${{ github.run_id }}-${{ github.run_attempt }}-off
 
-      # ---------------- Phone ON: set up and run the tracker ----------------
+      # ---------------- Phone ON: set up ----------------
       - uses: actions/setup-python@v5
         if: steps.phone.outputs.online == 'yes'
         with:
           python-version: "3.12"
           cache: "pip"
 
-      # Install BEFORE routing through the phone (uses GitHub's internet, not your data)
+      # Installs use GitHub's internet (not your phone)
       - name: Install libraries
         if: steps.phone.outputs.online == 'yes'
         timeout-minutes: 12
@@ -99,53 +107,76 @@ jobs:
         id: route
         if: steps.phone.outputs.online == 'yes'
         run: |
-          sudo tailscale set --exit-node="$EXIT_NODE"
-          sleep 3
-          # Everything else: GitHub's normal internet
-          sudo ip rule add pref 1100 lookup main
-          # Your Tailscale network + Cloudflare (BookMyShow): through the phone
-          for r in 100.64.0.0/10 \
-                   173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 \
-                   141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 \
-                   197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 \
-                   104.24.0.0/14 172.64.0.0/13 131.0.72.0/22; do
-            sudo ip rule add pref 1000 to "$r" lookup 52
-          done
-          sudo ip route flush cache || true
-          echo "Routing rules:"; ip rule show
+          ROUTED=no
+          if sudo tailscale set --exit-node="$EXIT_NODE"; then
+            sleep 3
+            # Everything else: GitHub's normal internet
+            sudo ip rule add pref 1100 lookup main || true
+            # Your Tailscale network + Cloudflare (BookMyShow): through the phone
+            for r in 100.64.0.0/10 \
+                     173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 \
+                     141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 \
+                     197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 \
+                     104.24.0.0/14 172.64.0.0/13 131.0.72.0/22; do
+              sudo ip rule add pref 1000 to "$r" lookup 52 || true
+            done
+            sudo ip route flush cache || true
+            echo "Routing rules:"; ip rule show
 
-          # Self-check: ask Cloudflare where we appear to be (should be India / your phone)
-          TRACE=$(curl -4 -s --max-time 30 https://www.cloudflare.com/cdn-cgi/trace || true)
-          CF_IP=$(echo "$TRACE" | grep '^ip=' | cut -d= -f2)
-          CF_LOC=$(echo "$TRACE" | grep '^loc=' | cut -d= -f2)
-          ISP=$(curl -s --max-time 15 "https://ipinfo.io/${CF_IP}/org" || echo "unknown")
-          echo "BookMyShow traffic appears from: ${CF_IP} (${CF_LOC}) - ${ISP}"
-          echo "Telegram/other traffic appears from: $(curl -s --max-time 15 https://ipinfo.io/org)"
-          echo "ISP=${ISP}" >> "$GITHUB_ENV"
-          if [ "$CF_LOC" != "IN" ]; then
-            echo "Routing through the phone did NOT work."
-            exit 1
+            # Self-check: where does Cloudflare (BookMyShow) see us? Should be India.
+            TRACE=$(curl -4 -s --max-time 30 https://www.cloudflare.com/cdn-cgi/trace || true)
+            CF_IP=$(echo "$TRACE" | grep '^ip=' | cut -d= -f2 | tr -d '\r')
+            CF_LOC=$(echo "$TRACE" | grep '^loc=' | cut -d= -f2 | tr -d '\r')
+            ISP=$(curl -s --max-time 15 "https://ipinfo.io/${CF_IP}/org" | head -n1 | tr -d '\r"{}' || true)
+            [ -z "$ISP" ] && ISP=unknown
+            echo "BookMyShow traffic appears from: ${CF_IP} (${CF_LOC}) - ${ISP}"
+            echo "Telegram/other traffic appears from: $(curl -s --max-time 15 https://ipinfo.io/org | head -n1)"
+            echo "ISP=${ISP} (${CF_LOC})" >> "$GITHUB_ENV"
+            if [ "$CF_LOC" = "IN" ]; then ROUTED=yes; fi
           fi
+          echo "routed=$ROUTED" >> "$GITHUB_OUTPUT"
+          echo "Routed through phone: $ROUTED"
 
+      # ---------------- Routing failed (e.g. 'Run as exit node' is off) ----------------
+      - name: Routing failed - tell you (once)
+        if: steps.route.outputs.routed == 'no' && steps.phone.outputs.last != 'noexit'
+        run: |
+          curl -s --max-time 30 --retry 3 -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            -d chat_id="${TG_CHAT}" \
+            --data-urlencode text="⚠️ Tailscale is on, but BookMyShow traffic couldn't be routed through your phone.
+          Check that 'Run as exit node' is ON in the Tailscale app. I'll retry every 5 minutes." || true
+          echo noexit > state.txt
+
+      - name: Routing failed - save state
+        if: steps.route.outputs.routed == 'no' && steps.phone.outputs.last != 'noexit'
+        uses: actions/cache/save@v4
+        with:
+          path: state.txt
+          key: phonestate-${{ github.run_id }}-${{ github.run_attempt }}-noexit
+
+      # ---------------- Routed OK: run the tracker ----------------
       - name: Tell you the phone (re)connected
-        if: steps.phone.outputs.online == 'yes' && steps.phone.outputs.last != 'online'
+        if: steps.route.outputs.routed == 'yes' && steps.phone.outputs.last != 'online'
         run: |
           curl -s --max-time 30 --retry 3 -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
             -d chat_id="${TG_CHAT}" \
             --data-urlencode text="✅ Phone connected - BMS tracker is running.
           Network: ${ISP}
-          You'll only hear from me again when shows open (or if the phone disconnects)."
-          echo online > state.txt
+          Doing a check now; you'll get a confirmation in a minute." || true
+
+      - name: Remember state (online)
+        if: steps.route.outputs.routed == 'yes'
+        run: echo online > state.txt
 
       - name: Save state (online)
-        if: steps.phone.outputs.online == 'yes' && steps.phone.outputs.last != 'online'
+        if: steps.route.outputs.routed == 'yes' && steps.phone.outputs.last != 'online'
         uses: actions/cache/save@v4
         with:
           path: state.txt
           key: phonestate-${{ github.run_id }}-${{ github.run_attempt }}-on
 
       - name: Load daily-message memory
-        if: steps.phone.outputs.online == 'yes'
+        if: steps.route.outputs.routed == 'yes'
         uses: actions/cache/restore@v4
         with:
           path: heartbeat.txt
@@ -154,57 +185,30 @@ jobs:
 
       - name: Check BookMyShow
         id: tracker
-        if: steps.phone.outputs.online == 'yes'
+        if: steps.route.outputs.routed == 'yes'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           JUST_CONNECTED: ${{ steps.phone.outputs.last != 'online' }}
         run: xvfb-run -a python tracker.py
 
-      # ---------------- Couldn't route through the phone ----------------
-      - name: Routing failed - tell you (once)
-        if: failure() && steps.route.outcome == 'failure' && steps.phone.outputs.last != 'noexit'
-        run: |
-          curl -s --max-time 30 --retry 3 -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-            -d chat_id="${TG_CHAT}" \
-            --data-urlencode text="⚠️ Tailscale is on, but BookMyShow traffic couldn't be routed through your phone.
-          Check that 'Run as exit node' is ON in the Tailscale app. I'll retry every 5 minutes."
-          echo noexit > state.txt
-
-      - name: Exit node off - save state
-        if: failure() && steps.route.outcome == 'failure' && steps.phone.outputs.last != 'noexit'
+      # ---------------- Save memory for the next run ----------------
+      - name: Save phone state for the next run
+        if: always() && steps.tracker.outcome != 'skipped' && hashFiles('state.txt') != ''
         uses: actions/cache/save@v4
         with:
           path: state.txt
-          key: phonestate-${{ github.run_id }}-${{ github.run_attempt }}-noexit
-
-      # ---------------- Phone lost during the run ----------------
-      - name: Phone disconnected - tell you
-        if: failure() && steps.tracker.outcome == 'failure'
-        run: |
-          # Telegram never goes through the phone, so this is sent right away
-          curl -s --max-time 30 --retry 3 -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-            -d chat_id="${TG_CHAT}" \
-            --data-urlencode text="⏸️ Phone disconnected - BMS tracker paused.
-          Turn Tailscale back on whenever you want; I'll message you when it's running again." || true
-          echo offline > state.txt
-
-      - name: Phone disconnected - save state
-        if: failure() && steps.tracker.outcome == 'failure'
-        uses: actions/cache/save@v4
-        with:
-          path: state.txt
-          key: phonestate-${{ github.run_id }}-${{ github.run_attempt }}-off2
+          key: phonestate-${{ github.run_id }}-${{ github.run_attempt }}-end
 
       - name: Save daily-message memory
-        if: always() && steps.phone.outputs.online == 'yes' && hashFiles('heartbeat.txt') != ''
+        if: always() && steps.tracker.outcome != 'skipped' && hashFiles('heartbeat.txt') != ''
         uses: actions/cache/save@v4
         with:
           path: heartbeat.txt
           key: heartbeat-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Save screenshot of the page
-        if: always() && steps.phone.outputs.online == 'yes'
+        if: always() && steps.tracker.outcome != 'skipped'
         uses: actions/upload-artifact@v4
         with:
           name: last-check-screenshot
