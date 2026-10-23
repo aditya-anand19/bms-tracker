@@ -3,7 +3,7 @@ name: BookMyShow Tracker
 on:
   schedule:
     - cron: "*/5 * * * *"   # restarts the tracker within ~5 min whenever a run ends
-  workflow_dispatch:         # adds a "Run workflow" button for manual tests
+  workflow_dispatch:         # "Run workflow" button for manual tests
 
 # Only one tracker runs at a time; extra scheduled starts wait in line.
 concurrency:
@@ -22,16 +22,64 @@ jobs:
           python-version: "3.12"
           cache: "pip"
 
+      # Install everything BEFORE routing through the phone (saves your data).
       - name: Install libraries
         run: |
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
+      # Join your Tailscale network and send all traffic out through your phone.
+      - name: Connect to your phone (Tailscale)
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          hostname: github-bms-tracker
+          args: --exit-node=${{ secrets.TS_EXIT_NODE }}
+
+      - name: Confirm traffic goes through the phone
+        run: |
+          echo "Internet provider seen by websites:"
+          curl -s --max-time 30 https://ipinfo.io/org || echo "Could not reach the internet through the phone"
+
       - name: Check BookMyShow
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python tracker.py
+        run: xvfb-run -a python tracker.py
+
+      # ---------- If the phone was unreachable: warn at most once an hour ----------
+      - name: Stop routing through the phone
+        if: failure()
+        run: sudo tailscale set --exit-node= || true
+
+      - name: Work out the current hour
+        if: failure()
+        id: hour
+        run: echo "h=$(TZ=Asia/Kolkata date +%Y%m%d%H)" >> "$GITHUB_OUTPUT"
+
+      - name: Check if already warned this hour
+        if: failure()
+        id: warned
+        uses: actions/cache/restore@v4
+        with:
+          path: warned.txt
+          key: warned-${{ steps.hour.outputs.h }}
+
+      - name: Send warning on Telegram
+        if: failure() && steps.warned.outputs.cache-hit != 'true'
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d text="WARNING: BMS tracker can't reach the internet through your phone. \
+          Is the phone on, with Tailscale connected and 'Run as exit node' ON?"
+          echo warned > warned.txt
+
+      - name: Remember the warning
+        if: failure() && steps.warned.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: warned.txt
+          key: warned-${{ steps.hour.outputs.h }}
 
       - name: Save screenshot of the page
         if: always()
