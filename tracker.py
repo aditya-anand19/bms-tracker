@@ -258,11 +258,17 @@ def msg_disconnected():
 
 
 def msg_routing_failed():
-    return ("⚠️ <b>Phone found, but routing through it failed</b>\n\n"
-            "Your phone answers on Tailscale, but Chrome's traffic couldn't be sent through it, "
-            "so I'm <b>not</b> checking BookMyShow right now.\n"
-            "Fix: open Tailscale on your phone and make sure <b>Run as exit node</b> is ON.\n"
-            "I'll retry every 5 minutes (this warning is sent once)."
+    reason = os.environ.get("ROUTE_FAIL_REASON", "").strip() or "Unknown problem."
+    if "exit node" in reason.lower():  # all phone-side reasons mention the exit node
+        hint = ("Fix: open Tailscale on your phone and make sure <b>Run as exit node</b> is ON.")
+    else:
+        hint = ("This is a problem on the GitHub side and usually fixes itself on the next run. "
+                "If it keeps happening, tell Claude.")
+    return ("⚠️ <b>Phone found, but BookMyShow checks couldn't start</b>\n\n"
+            f"<b>Reason:</b> {esc(reason)}\n"
+            f"{hint}\n\n"
+            "I'm <b>not</b> checking BookMyShow right now. I'll retry every 5 minutes "
+            "(this warning is sent once)."
             + footer(bms_view(max_age=0)))
 
 
@@ -356,7 +362,8 @@ def ensure_proxy():
         return
     log("Chrome's proxy wasn't running - restarting it.")
     try:
-        subprocess.run(["sudo", "-u", "bmsproxy", "tinyproxy", "-c", "/etc/tinyproxy-bms.conf"],
+        # started by root, tinyproxy switches itself to the "bmsproxy" user (see config)
+        subprocess.run(["sudo", "tinyproxy", "-c", "/etc/tinyproxy/tinyproxy.conf"],
                        capture_output=True, timeout=15)
         time.sleep(2)
     except Exception as e:
