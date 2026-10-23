@@ -89,7 +89,7 @@ def maybe_send_heartbeat(status, msg, checks_this_run):
     if now.hour < HEARTBEAT_HOUR or last_sent == today:
         return
 
-    if status in ("not_yet", "found"):
+    if status in ("not_yet", "found", "unsure"):
         head = "Still running \u2705 Everything is working."
         tail = "Sit back and relax - you'll get BOOK NOW + the link the moment it opens."
     else:
@@ -128,12 +128,22 @@ def check(page, target_url):
     log(f"HTTP {code} | landed on: {final_url}")
 
     if code in (403, 429) or any(
-        s in text for s in ["access denied", "verify you are human", "just a moment", "request blocked"]
+        s in text for s in ["access denied", "verify you are human", "just a moment",
+                            "request blocked", "you have been blocked"]
     ):
         return "blocked", f"BookMyShow blocked the check (HTTP {code})."
 
     if TARGET_DATE not in final_url:
         return "not_yet", "Date not open yet (redirected to another date)."
+
+    # Read the row of dates on the page (e.g. "05 nov", "thu 06 nov", "nov 7").
+    # BookMyShow only lists dates that are open for booking.
+    dates_on_page = dates_listed(text)
+    log(f"Dates listed on page: {', '.join(dates_on_page) or '(could not read)'}")
+    target_label = f"{int(TARGET_DATE[6:8])} {MONTHS[int(TARGET_DATE[4:6]) - 1]}"
+    if dates_on_page and target_label not in dates_on_page:
+        return "not_yet", (f"Date not open yet ({target_label} isn't in the date list; "
+                           f"open: {', '.join(dates_on_page)}).")
 
     if THEATRE_NAME:
         name = THEATRE_NAME.lower()
@@ -144,10 +154,34 @@ def check(page, target_url):
             starts = [m.start() for m in re.finditer(re.escape(name), text)]
             if not any(fmt in text[i:i + 700] for i in starts):
                 return "not_yet", f"{THEATRE_NAME} is listed, but no {FORMAT_KEYWORD} shows yet."
-            return "found", f"{FORMAT_KEYWORD} shows open at {THEATRE_NAME} on {TARGET_DATE}!"
-        return "found", f"Shows open at {THEATRE_NAME} on {TARGET_DATE}!"
+            found_msg = f"{FORMAT_KEYWORD} shows open at {THEATRE_NAME} on {target_label}!"
+        else:
+            found_msg = f"Shows open at {THEATRE_NAME} on {target_label}!"
+    else:
+        found_msg = f"Shows are open on {target_label}!"
 
-    return "found", f"Shows are open on {TARGET_DATE}!"
+    if not dates_on_page:
+        # Couldn't read the date row, so we can't be sure -> "unsure", not "found".
+        return "unsure", found_msg + " (couldn't confirm the date on the page)"
+    return "found", found_msg + f" (dates open: {', '.join(dates_on_page)})"
+
+
+MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+
+
+def dates_listed(text):
+    """Find dates like '05 nov', 'thu\n05\nnov', 'nov 5' in the page text."""
+    m = "|".join(MONTHS)
+    found = []
+    for d, mon in re.findall(rf"(?<![:.\d])\b(\d{{1,2}})\s*(?:st|nd|rd|th)?\s+({m})[a-z]*\b", text):
+        found.append(f"{int(d)} {mon}")
+    for mon, d in re.findall(rf"\b({m})[a-z]*\s+(\d{{1,2}})\b(?![:.]\d)", text):
+        found.append(f"{int(d)} {mon}")
+    out = []
+    for x in found:
+        if 1 <= int(x.split()[0]) <= 31 and x not in out:
+            out.append(x)
+    return out
 
 
 def main():
@@ -156,6 +190,7 @@ def main():
     stop_at = time.time() + RUN_FOR_MINUTES * 60
     test_results = []
     checks = 0
+    unsure_sent = False
     errors_in_a_row = 0
     blocked_in_a_row = 0
 
@@ -188,13 +223,16 @@ def main():
             if MANUAL_RUN and len(test_results) < 3:
                 test_results.append(status)
                 if len(test_results) == 3:
-                    ok = all(s in ("not_yet", "found") for s in test_results)
+                    ok = all(s in ("not_yet", "found", "unsure") for s in test_results)
                     send_telegram(f"Tracker test: {'OK' if ok else 'PROBLEM'} (via your phone)\n"
                                   f"First 3 checks: {', '.join(test_results)}\n"
                                   f"Latest: {msg}\n{target_url}")
 
             if status == "found":
                 send_telegram(f"BOOK NOW!!! {msg}\n{target_url}")
+            elif status == "unsure" and not unsure_sent:
+                send_telegram(f"MAYBE OPEN - please check manually.\n{msg}\n{target_url}")
+                unsure_sent = True
 
             # Phone unreachable for ~5 checks -> fail the run so the workflow
             # warns you (it sends that warning directly, not via the phone).
